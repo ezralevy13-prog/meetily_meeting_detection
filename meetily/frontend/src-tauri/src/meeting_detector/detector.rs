@@ -360,7 +360,10 @@ impl MeetingDetector {
                             if crate::is_recording().await {
                                 info!("Already recording, skipping auto-start");
                             } else {
-                                let meeting_name = format!("{} Meeting", meeting_info.app_name);
+                                // Prefer the title of whatever calendar event is
+                                // happening right now over a generic app name.
+                                let meeting_name = current_calendar_event_title()
+                                    .unwrap_or_else(|| format!("{} Meeting", meeting_info.app_name));
                                 info!("Auto-starting recording for: {}", meeting_name);
 
                                 // Emit event for any UI that wants to react
@@ -374,7 +377,7 @@ impl MeetingDetector {
 
                                 // Drive the same start path the tray uses, so the frontend
                                 // runs its model-readiness and device checks first.
-                                trigger_auto_start(&app);
+                                trigger_auto_start(&app, &meeting_name);
 
                                 auto_recording_active.store(true, Ordering::SeqCst);
                             }
@@ -507,14 +510,76 @@ fn detect_meeting_from_system(
     None
 }
 
+/// Look up the title of whatever calendar event is happening right now, via
+/// the macOS Calendar app, so recordings can be named after the meeting
+/// instead of a generic "<App> Meeting". Returns `None` if there's no
+/// current event, Calendar access hasn't been granted, or `osascript` fails
+/// -- callers should fall back to a generic name in that case.
+#[cfg(target_os = "macos")]
+fn current_calendar_event_title() -> Option<String> {
+    const SCRIPT: &str = r#"
+        tell application "Calendar"
+            set nowDate to current date
+            repeat with cal in calendars
+                try
+                    set matchingEvents to (every event of cal whose start date ≤ nowDate and end date ≥ nowDate)
+                    if (count of matchingEvents) > 0 then
+                        return summary of (item 1 of matchingEvents)
+                    end if
+                end try
+            end repeat
+            return ""
+        end tell
+    "#;
+
+    let output = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(SCRIPT)
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => {
+            let title = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if title.is_empty() {
+                None
+            } else {
+                Some(title)
+            }
+        }
+        Ok(output) => {
+            debug!(
+                "Calendar lookup via osascript failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            None
+        }
+        Err(e) => {
+            debug!("Failed to run osascript for calendar lookup: {}", e);
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn current_calendar_event_title() -> Option<String> {
+    None
+}
+
 /// Kick off a recording the same way the tray "Start recording" item does:
 /// set the frontend's autoStartRecording flag and route it to the home page,
 /// so all model-readiness and audio-device checks still run.
-fn trigger_auto_start<R: Runtime>(app: &AppHandle<R>) {
+fn trigger_auto_start<R: Runtime>(app: &AppHandle<R>, meeting_name: &str) {
     crate::tray::set_tray_state(app, crate::tray::RecordingState::Starting);
 
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.eval("sessionStorage.setItem('autoStartRecording', 'true')");
+        // JSON-encode so quotes/apostrophes/unicode in calendar titles can't
+        // break out of the string literal.
+        let name_json = serde_json::to_string(meeting_name).unwrap_or_else(|_| "null".to_string());
+        let _ = window.eval(format!(
+            "sessionStorage.setItem('autoStartMeetingTitle', {})",
+            name_json
+        ));
         let _ = window.eval("window.location.assign('/')");
     } else {
         warn!("No main window available to auto-start recording");
