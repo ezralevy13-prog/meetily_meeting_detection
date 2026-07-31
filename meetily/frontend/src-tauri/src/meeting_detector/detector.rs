@@ -59,6 +59,13 @@ fn default_auto_stop_grace_secs() -> u64 {
     30
 }
 
+/// How long after triggering an auto-start to wait for the recording to
+/// actually begin before concluding the frontend bailed (model not ready,
+/// device error). The frontend's failure UI lives in a window that is
+/// normally hidden in the tray, so without this watchdog a failed start is
+/// completely silent and leaves the tray stuck on "Starting...".
+const AUTO_START_TIMEOUT: Duration = Duration::from_secs(60);
+
 impl MeetingDetectionSettings {
     /// Clamp values that would make the monitor misbehave. A zero poll
     /// interval turns the monitor loop into a 100% CPU busy-loop, and the
@@ -338,6 +345,10 @@ impl MeetingDetector {
             // Needed to tell "user stopped it manually" apart from "the
             // frontend's start checks haven't finished yet".
             let mut auto_recording_observed = false;
+            // Deadline for the auto-started recording to actually begin; if it
+            // passes without a recording ever being observed, the frontend
+            // bailed and we surface that instead of staying silently stuck.
+            let mut auto_start_deadline: Option<Instant> = None;
 
             while is_monitoring.load(Ordering::SeqCst)
                 && generation.load(Ordering::SeqCst) == my_generation
@@ -357,13 +368,36 @@ impl MeetingDetector {
                 if auto_recording_active.load(Ordering::SeqCst) {
                     if crate::is_recording().await {
                         auto_recording_observed = true;
+                        auto_start_deadline = None;
                     } else if auto_recording_observed {
                         info!("Recording was stopped manually; releasing auto-stop ownership");
                         auto_recording_active.store(false, Ordering::SeqCst);
                         auto_recording_observed = false;
+                    } else if auto_start_deadline.is_some_and(|d| Instant::now() >= d) {
+                        // The frontend never started the recording (model not
+                        // ready, device error, ...). Its own error UI is in a
+                        // hidden window, so reset the tray out of "Starting..."
+                        // and tell the user via a real OS notification.
+                        warn!(
+                            "Auto-started recording did not begin within {}s; giving up",
+                            AUTO_START_TIMEOUT.as_secs()
+                        );
+                        auto_recording_active.store(false, Ordering::SeqCst);
+                        auto_start_deadline = None;
+                        crate::tray::update_tray_menu_async(&app).await;
+                        if let Err(e) = app
+                            .notification()
+                            .builder()
+                            .title("Meetily couldn't start recording")
+                            .body("A meeting was detected but recording didn't start. Open Meetily to record it.")
+                            .show()
+                        {
+                            warn!("Failed to show auto-start failure notification: {}", e);
+                        }
                     }
                 } else {
                     auto_recording_observed = false;
+                    auto_start_deadline = None;
                 }
 
                 system.refresh_processes(ProcessesToUpdate::All, true);
@@ -452,6 +486,7 @@ impl MeetingDetector {
 
                                 auto_recording_active.store(true, Ordering::SeqCst);
                                 auto_recording_observed = false;
+                                auto_start_deadline = Some(Instant::now() + AUTO_START_TIMEOUT);
                             }
                         }
 
@@ -695,6 +730,9 @@ fn trigger_auto_start<R: Runtime>(app: &AppHandle<R>, meeting_name: &str) {
 async fn trigger_auto_stop<R: Runtime>(app: &AppHandle<R>) {
     if !crate::is_recording().await {
         info!("Auto-stop requested but nothing is recording");
+        // Recompute the tray menu from actual state: if the auto-start never
+        // got the recording going, the tray may still be showing "Starting...".
+        crate::tray::update_tray_menu_async(app).await;
         return;
     }
 
