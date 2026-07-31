@@ -41,6 +41,7 @@ pub mod audio;
 pub mod config;
 pub mod console_utils;
 pub mod database;
+pub mod meeting_detector;
 pub mod notifications;
 pub mod ollama;
 pub mod onboarding;
@@ -417,6 +418,7 @@ pub fn run() {
         )) as NotificationManagerState<tauri::Wry>)
         .manage(audio::init_system_audio_state())
         .manage(summary::summary_engine::ModelManagerState(Arc::new(tokio::sync::Mutex::new(None))))
+        .manage(meeting_detector::commands::init_meeting_detector_state())
         .setup(|_app| {
             log::info!("Application setup complete");
 
@@ -509,6 +511,24 @@ pub fn run() {
                 log::warn!("Failed to resolve resource directory for templates");
             }
 
+            // Auto-start the meeting detection monitor if it is enabled in settings
+            let app_for_meeting_detection = _app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let detector_state = app_for_meeting_detection
+                    .state::<meeting_detector::commands::MeetingDetectorState>();
+                let detector = detector_state.read().await;
+                let settings = detector.get_settings().await;
+
+                if settings.enabled {
+                    log::info!("Meeting detection enabled, starting monitor...");
+                    detector
+                        .start_monitoring(app_for_meeting_detection.clone())
+                        .await;
+                } else {
+                    log::info!("Meeting detection disabled, skipping monitor");
+                }
+            });
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -527,6 +547,14 @@ pub fn run() {
             start_recording,
             stop_recording,
             is_recording,
+            meeting_detector::commands::enable_meeting_detection,
+            meeting_detector::commands::disable_meeting_detection,
+            meeting_detector::commands::get_meeting_detection_status,
+            meeting_detector::commands::get_meeting_detection_settings,
+            meeting_detector::commands::set_meeting_detection_settings,
+            meeting_detector::commands::check_for_active_meeting,
+            meeting_detector::commands::start_meeting_monitor,
+            meeting_detector::commands::stop_meeting_monitor,
             get_transcription_status,
             read_audio_file,
             save_transcript,
