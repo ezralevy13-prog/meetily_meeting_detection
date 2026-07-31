@@ -9,7 +9,7 @@ use log::{info, warn, error};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::path::PathBuf;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use tauri::{AppHandle, Emitter, Runtime, Manager};
@@ -47,6 +47,15 @@ pub struct MeetingDetectionSettings {
     pub notify_on_detection: bool,
     /// Polling interval in seconds
     pub poll_interval_secs: u64,
+    /// Seconds to wait after the meeting process disappears before treating
+    /// the meeting as ended. Absorbs a brief drop-and-rejoin (e.g. a flaky
+    /// Zoom connection) without splitting one meeting into two recordings.
+    #[serde(default = "default_auto_stop_grace_secs")]
+    pub auto_stop_grace_secs: u64,
+}
+
+fn default_auto_stop_grace_secs() -> u64 {
+    30
 }
 
 impl Default for MeetingDetectionSettings {
@@ -60,6 +69,7 @@ impl Default for MeetingDetectionSettings {
             detect_google_meet: true,
             notify_on_detection: true,
             poll_interval_secs: 5,
+            auto_stop_grace_secs: default_auto_stop_grace_secs(),
         }
     }
 }
@@ -297,6 +307,10 @@ impl MeetingDetector {
                 RefreshKind::new().with_processes(ProcessRefreshKind::everything()),
             );
             let mut was_in_meeting = false;
+            // Set while the meeting process is gone but we're still waiting out
+            // the grace period, in case it's a drop-and-rejoin rather than a
+            // real end of meeting.
+            let mut pending_stop_since: Option<Instant> = None;
 
             while is_monitoring.load(Ordering::SeqCst) {
                 let current_settings = settings.read().await.clone();
@@ -367,37 +381,70 @@ impl MeetingDetector {
                         }
 
                         was_in_meeting = true;
+                        pending_stop_since = None;
                     }
-                    (true, false) => {
-                        // Meeting ended
-                        info!("Meeting ended");
+                    (true, true) => {
+                        // Still in a meeting. If the process had briefly
+                        // disappeared (e.g. Zoom dropped and rejoined), cancel
+                        // the pending auto-stop so recording continues instead
+                        // of being split into two files.
+                        if pending_stop_since.take().is_some() {
+                            info!("Meeting process reappeared within the grace period, cancelling auto-stop");
+                        }
 
-                        // Clear current meeting
+                        // Keep the reported meeting info fresh.
                         {
                             let mut current = current_meeting.write().await;
-                            *current = None;
+                            *current = meeting;
                         }
-
-                        // Emit event to frontend
-                        let _ = app.emit("meeting-ended", ());
-
-                        // Auto-stop recording if enabled and we auto-started
-                        if current_settings.auto_stop_recording
-                            && auto_recording_active.load(Ordering::SeqCst)
-                        {
-                            info!("Auto-stopping recording");
-                            let _ = app.emit("auto-stop-recording", ());
-
-                            // Stop in the backend rather than relying on the
-                            // frontend, so this works with the window closed to tray.
-                            trigger_auto_stop(&app).await;
-
-                            auto_recording_active.store(false, Ordering::SeqCst);
-                        }
-
-                        was_in_meeting = false;
                     }
-                    _ => {} // No state change
+                    (true, false) => {
+                        // Meeting process disappeared. Don't treat it as ended
+                        // right away -- wait out a grace period first, in case
+                        // this is a drop-and-rejoin rather than a real end of
+                        // meeting.
+                        let grace = Duration::from_secs(current_settings.auto_stop_grace_secs);
+                        let since = *pending_stop_since.get_or_insert_with(|| {
+                            info!(
+                                "Meeting process disappeared, waiting up to {}s before treating it as ended",
+                                current_settings.auto_stop_grace_secs
+                            );
+                            Instant::now()
+                        });
+
+                        if since.elapsed() >= grace {
+                            info!("Meeting ended (grace period elapsed)");
+                            pending_stop_since = None;
+
+                            // Clear current meeting
+                            {
+                                let mut current = current_meeting.write().await;
+                                *current = None;
+                            }
+
+                            // Emit event to frontend
+                            let _ = app.emit("meeting-ended", ());
+
+                            // Auto-stop recording if enabled and we auto-started
+                            if current_settings.auto_stop_recording
+                                && auto_recording_active.load(Ordering::SeqCst)
+                            {
+                                info!("Auto-stopping recording");
+                                let _ = app.emit("auto-stop-recording", ());
+
+                                // Stop in the backend rather than relying on the
+                                // frontend, so this works with the window closed to tray.
+                                trigger_auto_stop(&app).await;
+
+                                auto_recording_active.store(false, Ordering::SeqCst);
+                            }
+
+                            was_in_meeting = false;
+                        }
+                        // else: still within the grace period -- keep recording,
+                        // keep was_in_meeting = true, and re-check next poll.
+                    }
+                    (false, false) => {} // No state change
                 }
 
                 tokio::time::sleep(Duration::from_secs(current_settings.poll_interval_secs)).await;
