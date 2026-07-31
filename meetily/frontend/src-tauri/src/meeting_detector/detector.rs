@@ -7,12 +7,13 @@ use crate::meeting_detector::meeting_apps::*;
 use log::debug;
 use log::{info, warn, error};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::path::PathBuf;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use tauri::{AppHandle, Emitter, Runtime, Manager};
+use tauri_plugin_notification::NotificationExt;
 use tokio::sync::RwLock;
 
 /// Represents a detected meeting
@@ -58,6 +59,18 @@ fn default_auto_stop_grace_secs() -> u64 {
     30
 }
 
+impl MeetingDetectionSettings {
+    /// Clamp values that would make the monitor misbehave. A zero poll
+    /// interval turns the monitor loop into a 100% CPU busy-loop, and the
+    /// settings file is hand-editable, so never trust it.
+    fn sanitized(mut self) -> Self {
+        if self.poll_interval_secs == 0 {
+            self.poll_interval_secs = 1;
+        }
+        self
+    }
+}
+
 impl Default for MeetingDetectionSettings {
     fn default() -> Self {
         Self {
@@ -86,10 +99,10 @@ impl MeetingDetectionSettings {
             if path.exists() {
                 match std::fs::read_to_string(&path) {
                     Ok(contents) => {
-                        match serde_json::from_str(&contents) {
+                        match serde_json::from_str::<Self>(&contents) {
                             Ok(settings) => {
                                 info!("Loaded meeting detection settings from {:?}", path);
-                                return settings;
+                                return settings.sanitized();
                             }
                             Err(e) => {
                                 error!("Failed to parse meeting detection settings: {}", e);
@@ -146,6 +159,10 @@ pub struct MeetingDetector {
     system: System,
     settings: Arc<RwLock<MeetingDetectionSettings>>,
     is_monitoring: Arc<AtomicBool>,
+    /// Bumped on every start/stop; a monitor loop exits as soon as the
+    /// generation no longer matches the one it was spawned with, so a quick
+    /// disable/enable can never leave two loops running.
+    monitor_generation: Arc<AtomicU64>,
     current_meeting: Arc<RwLock<Option<DetectedMeeting>>>,
     auto_recording_active: Arc<AtomicBool>,
 }
@@ -159,11 +176,14 @@ impl MeetingDetector {
               loaded_settings.enabled, loaded_settings.auto_start_recording);
         
         Self {
+            // Detection only ever reads process names, so skip the expensive
+            // per-process cmdline/env/cpu/memory collection.
             system: System::new_with_specifics(
-                RefreshKind::new().with_processes(ProcessRefreshKind::everything()),
+                RefreshKind::new().with_processes(ProcessRefreshKind::new()),
             ),
             settings: Arc::new(RwLock::new(loaded_settings)),
             is_monitoring: Arc::new(AtomicBool::new(false)),
+            monitor_generation: Arc::new(AtomicU64::new(0)),
             current_meeting: Arc::new(RwLock::new(None)),
             auto_recording_active: Arc::new(AtomicBool::new(false)),
         }
@@ -176,6 +196,7 @@ impl MeetingDetector {
 
     /// Update settings and persist to disk
     pub async fn set_settings(&self, settings: MeetingDetectionSettings) {
+        let settings = settings.sanitized();
         // Save to disk first
         if let Err(e) = settings.save() {
             error!("Failed to save meeting detection settings: {}", e);
@@ -295,30 +316,54 @@ impl MeetingDetector {
         }
 
         self.is_monitoring.store(true, Ordering::SeqCst);
-        info!("Starting meeting detection monitor");
+        let my_generation = self.monitor_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        info!("Starting meeting detection monitor (generation {})", my_generation);
 
         let is_monitoring = self.is_monitoring.clone();
+        let generation = self.monitor_generation.clone();
         let settings = self.settings.clone();
         let current_meeting = self.current_meeting.clone();
         let auto_recording_active = self.auto_recording_active.clone();
 
         tokio::spawn(async move {
             let mut system = System::new_with_specifics(
-                RefreshKind::new().with_processes(ProcessRefreshKind::everything()),
+                RefreshKind::new().with_processes(ProcessRefreshKind::new()),
             );
             let mut was_in_meeting = false;
             // Set while the meeting process is gone but we're still waiting out
             // the grace period, in case it's a drop-and-rejoin rather than a
             // real end of meeting.
             let mut pending_stop_since: Option<Instant> = None;
+            // True once we've actually seen the auto-started recording running.
+            // Needed to tell "user stopped it manually" apart from "the
+            // frontend's start checks haven't finished yet".
+            let mut auto_recording_observed = false;
 
-            while is_monitoring.load(Ordering::SeqCst) {
+            while is_monitoring.load(Ordering::SeqCst)
+                && generation.load(Ordering::SeqCst) == my_generation
+            {
                 let current_settings = settings.read().await.clone();
 
                 if !current_settings.enabled {
                     tokio::time::sleep(Duration::from_secs(current_settings.poll_interval_secs))
                         .await;
                     continue;
+                }
+
+                // A manual stop hands the recording back to the user: once the
+                // auto-started recording has been seen running, a later
+                // not-recording state means the user stopped it themselves, so
+                // auto-stop must not touch whatever they record next.
+                if auto_recording_active.load(Ordering::SeqCst) {
+                    if crate::is_recording().await {
+                        auto_recording_observed = true;
+                    } else if auto_recording_observed {
+                        info!("Recording was stopped manually; releasing auto-stop ownership");
+                        auto_recording_active.store(false, Ordering::SeqCst);
+                        auto_recording_observed = false;
+                    }
+                } else {
+                    auto_recording_observed = false;
                 }
 
                 system.refresh_processes(ProcessesToUpdate::All, true);
@@ -344,15 +389,24 @@ impl MeetingDetector {
                         // Emit event to frontend
                         let _ = app.emit("meeting-detected", &meeting_info);
 
-                        // Show notification if enabled
+                        // Show notification if enabled. This must be a real OS
+                        // notification: the window is normally hidden in the
+                        // tray, so an in-app event alone would never be seen.
                         if current_settings.notify_on_detection {
-                            let _ = app.emit(
-                                "meeting-detection-notification",
-                                serde_json::json!({
-                                    "title": format!("{} Meeting Detected", meeting_info.app_name),
-                                    "body": "Click to start recording"
-                                }),
-                            );
+                            let body = if current_settings.auto_start_recording {
+                                "Meetily is starting a recording"
+                            } else {
+                                "Open Meetily to record this meeting"
+                            };
+                            if let Err(e) = app
+                                .notification()
+                                .builder()
+                                .title(format!("{} Meeting Detected", meeting_info.app_name))
+                                .body(body)
+                                .show()
+                            {
+                                warn!("Failed to show meeting-detected notification: {}", e);
+                            }
                         }
 
                         // Auto-start recording if enabled
@@ -362,8 +416,25 @@ impl MeetingDetector {
                             } else {
                                 // Prefer the title of whatever calendar event is
                                 // happening right now over a generic app name.
-                                let meeting_name = current_calendar_event_title()
-                                    .unwrap_or_else(|| format!("{} Meeting", meeting_info.app_name));
+                                // Run it off-thread with a timeout: AppleScript
+                                // queries over large calendars can take many
+                                // seconds and must not delay the recording. Only
+                                // attempt it while Calendar.app is already
+                                // running, because `tell application` would
+                                // otherwise launch it mid-join.
+                                let calendar_running = system_has_process(&system, "Calendar");
+                                let fallback_name = format!("{} Meeting", meeting_info.app_name);
+                                let meeting_name = match tokio::time::timeout(
+                                    Duration::from_secs(3),
+                                    tokio::task::spawn_blocking(move || {
+                                        current_calendar_event_title(calendar_running)
+                                    }),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(Some(title))) => title,
+                                    _ => fallback_name,
+                                };
                                 info!("Auto-starting recording for: {}", meeting_name);
 
                                 // Emit event for any UI that wants to react
@@ -380,6 +451,7 @@ impl MeetingDetector {
                                 trigger_auto_start(&app, &meeting_name);
 
                                 auto_recording_active.store(true, Ordering::SeqCst);
+                                auto_recording_observed = false;
                             }
                         }
 
@@ -395,10 +467,15 @@ impl MeetingDetector {
                             info!("Meeting process reappeared within the grace period, cancelling auto-stop");
                         }
 
-                        // Keep the reported meeting info fresh.
-                        {
+                        // Refresh the reported meeting only if the app changed,
+                        // so detected_at keeps meaning "when the meeting was
+                        // first seen" rather than "last poll".
+                        if let Some(new_meeting) = meeting {
                             let mut current = current_meeting.write().await;
-                            *current = meeting;
+                            match current.as_mut() {
+                                Some(cur) if cur.app_name == new_meeting.app_name => {}
+                                _ => *current = Some(new_meeting),
+                            }
                         }
                     }
                     (true, false) => {
@@ -460,6 +537,10 @@ impl MeetingDetector {
     /// Stop the background monitoring task
     pub fn stop_monitoring(&self) {
         info!("Stopping meeting detection monitor");
+        // Bump the generation as well as clearing the flag: if monitoring is
+        // restarted before the old loop next wakes, the flag alone would read
+        // true again and the old loop would keep running alongside the new one.
+        self.monitor_generation.fetch_add(1, Ordering::SeqCst);
         self.is_monitoring.store(false, Ordering::SeqCst);
     }
 }
@@ -510,19 +591,41 @@ fn detect_meeting_from_system(
     None
 }
 
+/// True if a process with exactly this name (case-insensitive) is running.
+fn system_has_process(system: &System, name: &str) -> bool {
+    system
+        .processes()
+        .values()
+        .any(|p| p.name().to_string_lossy().eq_ignore_ascii_case(name))
+}
+
 /// Look up the title of whatever calendar event is happening right now, via
 /// the macOS Calendar app, so recordings can be named after the meeting
 /// instead of a generic "<App> Meeting". Returns `None` if there's no
 /// current event, Calendar access hasn't been granted, or `osascript` fails
 /// -- callers should fall back to a generic name in that case.
+///
+/// Blocking (osascript can take seconds on large calendars): callers must run
+/// it via `spawn_blocking`, ideally under a timeout. `calendar_running` should
+/// come from a process scan -- `tell application "Calendar"` launches the app
+/// when it isn't running, and popping Calendar open mid-meeting-join is worse
+/// than falling back to a generic recording name.
 #[cfg(target_os = "macos")]
-fn current_calendar_event_title() -> Option<String> {
+fn current_calendar_event_title(calendar_running: bool) -> Option<String> {
+    if !calendar_running {
+        debug!("Calendar.app is not running, skipping calendar lookup");
+        return None;
+    }
+
+    // All-day events are excluded: they span the whole day (holidays,
+    // birthdays, "Vacation"), so they'd otherwise always win over the
+    // actual meeting slot.
     const SCRIPT: &str = r#"
         tell application "Calendar"
             set nowDate to current date
             repeat with cal in calendars
                 try
-                    set matchingEvents to (every event of cal whose start date ≤ nowDate and end date ≥ nowDate)
+                    set matchingEvents to (every event of cal whose allday event is false and start date ≤ nowDate and end date ≥ nowDate)
                     if (count of matchingEvents) > 0 then
                         return summary of (item 1 of matchingEvents)
                     end if
@@ -561,7 +664,7 @@ fn current_calendar_event_title() -> Option<String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn current_calendar_event_title() -> Option<String> {
+fn current_calendar_event_title(_calendar_running: bool) -> Option<String> {
     None
 }
 
