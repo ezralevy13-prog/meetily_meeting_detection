@@ -65,6 +65,28 @@ pub struct TranscriptionStatus {
 // RECORDING COMMANDS
 // ============================================================================
 
+/// Reset the whisper live-transcription context for a new recording, seeded
+/// with the meeting name when it carries real vocabulary (e.g. attendee names
+/// in a calendar-derived title). A generated timestamp title has none, so it
+/// just clears the context left over from the previous recording.
+async fn reset_whisper_live_context(meeting_name: &str) {
+    let engine = {
+        let guard = crate::whisper_engine::commands::WHISPER_ENGINE.lock().unwrap();
+        guard.as_ref().cloned()
+    };
+    if let Some(engine) = engine {
+        let looks_generated = meeting_name
+            .strip_prefix("Meeting ")
+            .map(|rest| {
+                rest.chars()
+                    .all(|c| c.is_ascii_digit() || matches!(c, '_' | '-' | ':' | ' '))
+            })
+            .unwrap_or(false);
+        let seed = (!looks_generated).then_some(meeting_name);
+        engine.reset_live_context(seed).await;
+    }
+}
+
 /// Start recording with default devices
 pub async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     start_recording_with_meeting_name(app, None).await
@@ -224,6 +246,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
             now.format("%Y-%m-%d_%H-%M-%S")
         )
     });
+    reset_whisper_live_context(&effective_meeting_name).await;
     manager.set_meeting_name(Some(effective_meeting_name));
 
     // Set up error callback
@@ -395,6 +418,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
             now.format("%Y-%m-%d_%H-%M-%S")
         )
     });
+    reset_whisper_live_context(&effective_meeting_name).await;
     manager.set_meeting_name(Some(effective_meeting_name));
 
     // Set up error callback

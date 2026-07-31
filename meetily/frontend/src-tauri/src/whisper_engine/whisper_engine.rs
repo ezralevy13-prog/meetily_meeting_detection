@@ -47,6 +47,11 @@ pub struct WhisperEngine {
     cancel_download_flag: Arc<RwLock<Option<String>>>, // Model name being cancelled
     // Active downloads tracking to prevent concurrent downloads
     active_downloads: Arc<RwLock<HashSet<String>>>, // Set of models currently being downloaded
+    // Rolling tail of the live transcript, fed to the decoder as an initial
+    // prompt so each chunk is conditioned on what came before it instead of
+    // being decoded blind (keeps names, casing, and punctuation consistent
+    // across chunk boundaries)
+    live_context: Arc<RwLock<String>>,
 }
 
 impl WhisperEngine {
@@ -163,6 +168,7 @@ impl WhisperEngine {
             cancel_download_flag: Arc::new(RwLock::new(None)),
             // Initialize active downloads tracking
             active_downloads: Arc::new(RwLock::new(HashSet::new())),
+            live_context: Arc::new(RwLock::new(String::new())),
         };
         
         Ok(engine)
@@ -512,6 +518,53 @@ impl WhisperEngine {
         repeated_words as f32 / total_words
     }
     
+    /// Maximum characters of rolling transcript kept as decoder context.
+    /// ~200 chars is roughly 50 tokens: enough to carry names, casing, and
+    /// sentence flow across chunk boundaries without eating far into
+    /// whisper's 224-token prompt budget.
+    const LIVE_CONTEXT_MAX_CHARS: usize = 200;
+
+    /// Reset the rolling live-transcription context for a new recording,
+    /// optionally seeding it (e.g. with the meeting title) so names and
+    /// domain terms are spelled correctly from the very first chunk.
+    pub async fn reset_live_context(&self, seed: Option<&str>) {
+        let mut ctx = self.live_context.write().await;
+        ctx.clear();
+        if let Some(seed) = seed {
+            ctx.push_str(seed.trim());
+        }
+    }
+
+    /// Append freshly transcribed text to the rolling context, keeping only
+    /// the most recent tail. Degenerate (highly repetitive) output clears the
+    /// context instead, so a hallucination is never fed back into the decoder
+    /// where it would compound on the next chunk.
+    async fn update_live_context(&self, new_text: &str) {
+        let trimmed = new_text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+
+        let mut ctx = self.live_context.write().await;
+        if Self::calculate_repetition_ratio(trimmed) > 0.4 {
+            ctx.clear();
+            return;
+        }
+
+        if !ctx.is_empty() {
+            ctx.push(' ');
+        }
+        ctx.push_str(trimmed);
+
+        if ctx.len() > Self::LIVE_CONTEXT_MAX_CHARS {
+            let mut cut = ctx.len() - Self::LIVE_CONTEXT_MAX_CHARS;
+            while !ctx.is_char_boundary(cut) {
+                cut += 1;
+            }
+            ctx.drain(..cut);
+        }
+    }
+
     /// Transcribe audio with streaming support for partial results and adaptive quality
     pub async fn transcribe_audio_with_confidence(&self, audio_data: Vec<f32>, language: Option<String>) -> Result<(String, f32, bool)> {
         let ctx_lock = self.current_context.read().await;
@@ -567,6 +620,15 @@ impl WhisperEngine {
         params.set_max_len(200);
         params.set_single_segment(false);
 
+        // Prime the decoder with the rolling tail of the transcript so far.
+        // Chunks are decoded independently, so without this every chunk
+        // starts blind and names, casing, and punctuation drift between
+        // chunks. (NUL check: set_initial_prompt panics on interior NULs.)
+        let live_context = self.live_context.read().await.clone();
+        if !live_context.is_empty() && !live_context.contains('\0') {
+            params.set_initial_prompt(&live_context);
+        }
+
         // Set thread count based on hardware (if supported by whisper.cpp)
         if let Some(_max_threads) = adaptive_config.max_threads {
             // Note: whisper.cpp may or may not expose thread control through params
@@ -621,6 +683,9 @@ impl WhisperEngine {
         let final_result = result.trim().to_string();
         let cleaned_result = Self::clean_repetitive_text(&final_result);
 
+        // Feed this chunk's text into the rolling context for the next chunk.
+        self.update_live_context(&cleaned_result).await;
+
         let avg_confidence = if segment_count > 0 {
             total_confidence / segment_count as f32
         } else {
@@ -671,7 +736,7 @@ impl WhisperEngine {
         // BALANCED settings - good quality with reasonable speed
         params.set_suppress_blank(true);
         params.set_suppress_non_speech_tokens(true);
-        params.set_temperature(0.3);             // Lower than 0.4 for consistency, higher than 0.0 for quality
+        params.set_temperature(0.0);             // Deterministic; whisper.cpp's fallback ladder raises it only on failed decodes
         params.set_max_initial_ts(1.0);
         params.set_entropy_thold(2.4);
         params.set_logprob_thold(-1.0);
