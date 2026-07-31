@@ -3,7 +3,9 @@
 //! Provides process monitoring and meeting detection for Zoom, Teams, and Google Meet.
 
 use crate::meeting_detector::meeting_apps::*;
-use log::{debug, info, warn, error};
+#[cfg(target_os = "macos")]
+use log::debug;
+use log::{info, warn, error};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
