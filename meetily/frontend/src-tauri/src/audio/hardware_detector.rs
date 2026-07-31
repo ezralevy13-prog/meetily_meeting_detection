@@ -202,12 +202,18 @@ impl HardwareProfile {
 
     /// Generate adaptive Whisper configuration based on hardware
     pub fn get_whisper_config(&self) -> AdaptiveWhisperConfig {
+        // Temperature is 0.0 (greedy/beam argmax) on every tier: whisper.cpp's
+        // built-in fallback ladder (temperature_inc = 0.2) already raises the
+        // temperature when decoding fails its entropy/logprob checks, so a
+        // fixed nonzero temperature only adds random sampling noise to every
+        // chunk without any robustness benefit.
+
         // Windows-specific override: Always use beam size 2 for stability
         #[cfg(target_os = "windows")]
         {
             return AdaptiveWhisperConfig {
                 beam_size: 2,
-                temperature: 0.2,
+                temperature: 0.0,
                 use_gpu: self.has_gpu_acceleration,
                 max_threads: Some(self.cpu_cores.min(8) as usize),
                 chunk_size_preference: ChunkSizePreference::Balanced,
@@ -220,28 +226,30 @@ impl HardwareProfile {
             match self.performance_tier {
                 PerformanceTier::Ultra => AdaptiveWhisperConfig {
                     beam_size: 5,  // Maximum quality
-                    temperature: 0.1,
+                    temperature: 0.0,
                     use_gpu: self.has_gpu_acceleration,
                     max_threads: Some(self.cpu_cores.min(8) as usize),
                     chunk_size_preference: ChunkSizePreference::Quality,
                 },
                 PerformanceTier::High => AdaptiveWhisperConfig {
-                    beam_size: 3,  // High quality
-                    temperature: 0.2,
+                    // With GPU acceleration the beam width is not the
+                    // bottleneck, so run full quality; only narrow it on CPU.
+                    beam_size: if self.has_gpu_acceleration { 5 } else { 3 },
+                    temperature: 0.0,
                     use_gpu: self.has_gpu_acceleration,
                     max_threads: Some(self.cpu_cores.min(6) as usize),
                     chunk_size_preference: ChunkSizePreference::Balanced,
                 },
                 PerformanceTier::Medium => AdaptiveWhisperConfig {
-                    beam_size: 2,  // Balanced
-                    temperature: 0.3,
+                    beam_size: if self.has_gpu_acceleration { 3 } else { 2 },
+                    temperature: 0.0,
                     use_gpu: self.has_gpu_acceleration,
                     max_threads: Some(self.cpu_cores.min(4) as usize),
                     chunk_size_preference: ChunkSizePreference::Balanced,
                 },
                 PerformanceTier::Low => AdaptiveWhisperConfig {
                     beam_size: 1,  // Fast processing
-                    temperature: 0.4,
+                    temperature: 0.0,
                     use_gpu: false, // Force CPU to avoid GPU overhead on weak hardware
                     max_threads: Some(2),
                     chunk_size_preference: ChunkSizePreference::Fast,
