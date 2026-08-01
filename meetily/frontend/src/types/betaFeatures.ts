@@ -22,10 +22,18 @@ export interface BetaFeatures {
    * @since v0.3.0
    */
   importAndRetranscribe: boolean;
+
+  /**
+   * After each recording, automatically re-transcribe the saved audio with the
+   * batch pipeline (long, context-rich segments) and replace the live transcript
+   * @since v0.4.0
+   */
+  autoFinalPass: boolean;
 }
 
 export const DEFAULT_BETA_FEATURES: BetaFeatures = {
   importAndRetranscribe: true, // Default: enabled
+  autoFinalPass: false, // Default: disabled (adds a post-meeting processing pass)
 };
 
 
@@ -34,6 +42,7 @@ export const DEFAULT_BETA_FEATURES: BetaFeatures = {
  */
 export const BETA_FEATURE_NAMES: Record<keyof BetaFeatures, string> = {
   importAndRetranscribe: 'Import Audio & Retranscribe',
+  autoFinalPass: 'High-Accuracy Final Pass',
 };
 
 /**
@@ -41,6 +50,7 @@ export const BETA_FEATURE_NAMES: Record<keyof BetaFeatures, string> = {
  */
 export const BETA_FEATURE_DESCRIPTIONS: Record<keyof BetaFeatures, string> = {
   importAndRetranscribe: 'Import audio files to transcribe or retranscribe existing meetings with different language settings.',
+  autoFinalPass: 'After each recording, automatically re-transcribe the saved audio in one high-quality pass and use it for the transcript and summary. Adds processing time after the meeting ends.',
 };
 
 /**

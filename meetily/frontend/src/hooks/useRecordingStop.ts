@@ -1,12 +1,15 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
+import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
 import { useTranscripts } from '@/contexts/TranscriptContext';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
+import { useConfig } from '@/contexts/ConfigContext';
 import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateContext';
 import { storageService } from '@/services/storageService';
 import { transcriptService } from '@/services/transcriptService';
+import { loadBetaFeatures } from '@/types/betaFeatures';
 import Analytics from '@/lib/analytics';
 import {
   applyPinnedSummaryLanguageToMeeting,
@@ -66,6 +69,8 @@ export function useRecordingStop(
     meetings,
     setIsMeetingActive,
   } = useSidebar();
+
+  const { transcriptModelConfig, selectedLanguage } = useConfig();
 
   const router = useRouter();
 
@@ -296,6 +301,37 @@ export function useRecordingStop(
           // Mark meeting as saved in IndexedDB (for recovery system)
           await markMeetingAsSaved();
 
+          // High-accuracy final pass (beta): re-run the saved audio through
+          // the batch retranscription path, which decodes long context-rich
+          // segments instead of the live pipeline's small real-time chunks.
+          // The meeting-details page defers auto-summary until it completes
+          // (via the final_pass_meeting_id flag) and refreshes on completion.
+          // Failure to start is non-fatal -- the live transcript stands.
+          try {
+            const betaFeatures = loadBetaFeatures();
+            const provider = transcriptModelConfig.provider;
+            const isLocalProvider = provider === 'localWhisper' || provider === 'parakeet';
+            if (betaFeatures.autoFinalPass && folderPath && isLocalProvider) {
+              await invoke('start_retranscription_command', {
+                meetingId,
+                meetingFolderPath: folderPath,
+                language:
+                  provider === 'parakeet' || !selectedLanguage || selectedLanguage === 'auto'
+                    ? null
+                    : selectedLanguage,
+                model: transcriptModelConfig.model || null,
+                provider: provider === 'parakeet' ? 'parakeet' : 'whisper',
+              });
+              sessionStorage.setItem('final_pass_meeting_id', meetingId);
+              toast.info('Improving transcript in the background...', {
+                description: 'The transcript and summary will use the high-accuracy pass when it finishes.',
+                duration: 8000,
+              });
+            }
+          } catch (finalPassError) {
+            console.warn('High-accuracy final pass failed to start; keeping live transcript:', finalPassError);
+          }
+
           // Clean up session storage
           sessionStorage.removeItem('last_recording_folder_path');
           sessionStorage.removeItem('last_recording_meeting_name');
@@ -435,6 +471,8 @@ export function useRecordingStop(
     meetings,
     setIsMeetingActive,
     router,
+    transcriptModelConfig,
+    selectedLanguage,
   ]);
 
   // Expose handleRecordingStop function to window for Rust callbacks

@@ -6,6 +6,8 @@ import PageContent from "./page-content";
 import { useRouter, useSearchParams } from "next/navigation";
 import Analytics from "@/lib/analytics";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, UnlistenFn } from "@tauri-apps/api/event";
+import { toast } from "sonner";
 import { LoaderIcon } from "lucide-react";
 import { useConfig } from "@/contexts/ConfigContext";
 import { usePaginatedTranscripts } from "@/hooks/usePaginatedTranscripts";
@@ -32,6 +34,10 @@ function MeetingDetailsContent() {
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [shouldAutoGenerate, setShouldAutoGenerate] = useState<boolean>(false);
   const [hasCheckedAutoGen, setHasCheckedAutoGen] = useState<boolean>(false);
+  // True while an automatic high-accuracy final pass (started by
+  // useRecordingStop) is still running for this meeting. Auto-summary is
+  // deferred until it finishes so the summary uses the final transcript.
+  const [finalPassPending, setFinalPassPending] = useState<boolean>(false);
 
   // Use pagination hook for efficient transcript loading
   const {
@@ -64,6 +70,15 @@ function MeetingDetailsContent() {
   // Set up auto-generation - respects DB as source of truth
   const setupAutoGeneration = useCallback(async () => {
     if (hasCheckedAutoGen) return; // Only check once
+
+    // A high-accuracy final pass is still rewriting this meeting's
+    // transcript; hold off so the summary is generated from the final
+    // version. The retranscription-complete listener re-triggers this
+    // check by clearing finalPassPending (hasCheckedAutoGen stays false).
+    if (finalPassPending) {
+      console.log('Final pass in progress, deferring auto-generation');
+      return;
+    }
 
     // Only auto-generate if navigated from recording
     if (source !== 'recording') {
@@ -114,7 +129,65 @@ function MeetingDetailsContent() {
     }
 
     setHasCheckedAutoGen(true);
-  }, [hasCheckedAutoGen, checkForGemmaModel, source, isAutoSummary]);
+  }, [hasCheckedAutoGen, checkForGemmaModel, source, isAutoSummary, finalPassPending]);
+
+  // Track whether an automatic final pass is pending for this meeting, and
+  // refresh the transcript when it completes. The manual Enhance dialog runs
+  // through the same backend events but never sets final_pass_meeting_id, so
+  // it is unaffected by this listener.
+  useEffect(() => {
+    if (!meetingId) return;
+
+    setFinalPassPending(sessionStorage.getItem('final_pass_meeting_id') === meetingId);
+
+    let unlistenComplete: UnlistenFn | undefined;
+    let unlistenError: UnlistenFn | undefined;
+    let cleanedUp = false;
+
+    const setupListeners = async () => {
+      unlistenComplete = await listen<{ meeting_id: string; segments_count: number }>(
+        'retranscription-complete',
+        async (event) => {
+          if (event.payload.meeting_id !== meetingId) return;
+          if (sessionStorage.getItem('final_pass_meeting_id') !== meetingId) return;
+
+          sessionStorage.removeItem('final_pass_meeting_id');
+          setFinalPassPending(false);
+          toast.success('High-accuracy transcript ready', {
+            description: `${event.payload.segments_count} segments transcribed from the recording.`,
+          });
+          await refetch();
+        }
+      );
+
+      unlistenError = await listen<{ meeting_id: string; error: string }>(
+        'retranscription-error',
+        (event) => {
+          if (event.payload.meeting_id !== meetingId) return;
+          if (sessionStorage.getItem('final_pass_meeting_id') !== meetingId) return;
+
+          sessionStorage.removeItem('final_pass_meeting_id');
+          setFinalPassPending(false);
+          toast.warning('High-accuracy pass failed; keeping the live transcript', {
+            description: event.payload.error,
+          });
+        }
+      );
+
+      if (cleanedUp) {
+        unlistenComplete?.();
+        unlistenError?.();
+      }
+    };
+
+    setupListeners();
+
+    return () => {
+      cleanedUp = true;
+      unlistenComplete?.();
+      unlistenError?.();
+    };
+  }, [meetingId, refetch]);
 
   // Sync meeting metadata from pagination hook to meeting details state
   useEffect(() => {

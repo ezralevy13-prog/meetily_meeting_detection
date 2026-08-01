@@ -300,7 +300,13 @@ async fn run_retranscription<R: Runtime>(
 
     // Initialize the appropriate engine once (not per-segment)
     let whisper_engine = if !use_parakeet {
-        Some(get_or_init_whisper(&app, model.as_deref()).await?)
+        let engine = get_or_init_whisper(&app, model.as_deref()).await?;
+        // The engine is shared with live transcription, so start the batch
+        // with a clean rolling context: without this the first segment would
+        // be primed with the tail of the just-recorded meeting. Context then
+        // accrues naturally across this file's sequential segments.
+        engine.reset_live_context(None).await;
+        Some(engine)
     } else {
         None
     };
