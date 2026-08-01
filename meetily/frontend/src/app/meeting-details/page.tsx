@@ -11,6 +11,7 @@ import { toast } from "sonner";
 import { LoaderIcon } from "lucide-react";
 import { useConfig } from "@/contexts/ConfigContext";
 import { usePaginatedTranscripts } from "@/hooks/usePaginatedTranscripts";
+import { MeetingChatPanel } from "@/components/MeetingDetails/MeetingChatPanel";
 
 interface MeetingDetailsResponse {
   id: string;
@@ -453,6 +454,20 @@ function MeetingDetailsContent() {
   />;
 }
 
+function MeetingDetailsWithChat() {
+  const searchParams = useSearchParams();
+  const meetingId = searchParams.get('id');
+
+  return (
+    <>
+      <MeetingDetailsContent />
+      {meetingId && meetingId !== 'intro-call' && (
+        <MeetingChatPanel meetingId={meetingId} />
+      )}
+    </>
+  );
+}
+
 export default function MeetingDetails() {
   return (
     <Suspense fallback={
@@ -460,7 +475,7 @@ export default function MeetingDetails() {
         <LoaderIcon className="animate-spin size-6" />
       </div>
     }>
-      <MeetingDetailsContent />
+      <MeetingDetailsWithChat />
     </Suspense>
   );
 }
