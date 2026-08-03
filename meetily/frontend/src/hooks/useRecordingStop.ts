@@ -9,6 +9,7 @@ import { useConfig } from '@/contexts/ConfigContext';
 import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateContext';
 import { storageService } from '@/services/storageService';
 import { transcriptService } from '@/services/transcriptService';
+import { configService } from '@/services/configService';
 import { loadBetaFeatures } from '@/types/betaFeatures';
 import Analytics from '@/lib/analytics';
 import {
@@ -311,7 +312,16 @@ export function useRecordingStop(
             const betaFeatures = loadBetaFeatures();
             const provider = transcriptModelConfig.provider;
             const isLocalProvider = provider === 'localWhisper' || provider === 'parakeet';
-            if (betaFeatures.autoFinalPass && folderPath && isLocalProvider) {
+            // A recording that captured nothing has no audio file to re-read,
+            // and one saved with audio saving turned off has no file either.
+            // Starting the pass in those cases just produces a "No audio file
+            // found" error and a failure toast, so skip it.
+            const audioSavingEnabled = await configService
+              .getRecordingPreferences()
+              .then((prefs) => prefs?.auto_save !== false)
+              .catch(() => true);
+            const hasSomethingToImprove = freshTranscripts.length > 0 && audioSavingEnabled;
+            if (betaFeatures.autoFinalPass && folderPath && isLocalProvider && hasSomethingToImprove) {
               await invoke('start_retranscription_command', {
                 meetingId,
                 meetingFolderPath: folderPath,

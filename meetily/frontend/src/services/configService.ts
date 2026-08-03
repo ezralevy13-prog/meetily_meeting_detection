@@ -39,6 +39,10 @@ export interface CustomOpenAIConfig {
 export interface RecordingPreferences {
   preferred_mic_device: string | null;
   preferred_system_device: string | null;
+  /** Whether the .wav is written when recording stops. */
+  auto_save: boolean;
+  save_folder: string;
+  file_format: string;
 }
 
 /**
