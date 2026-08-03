@@ -12,17 +12,45 @@ interface ChatMessage {
   content: string;
 }
 
+/** A transcript line from the live recording, as held in TranscriptContext. */
+export interface LiveTranscriptLine {
+  text: string;
+  audio_start_time?: number;
+}
+
 interface MeetingChatPanelProps {
-  meetingId: string;
+  /** Saved meeting to chat about; transcript is read from the database. */
+  meetingId?: string;
+  /**
+   * Transcript of the meeting currently being recorded. When provided, the
+   * panel chats about the in-progress meeting instead of a saved one -- it
+   * is read fresh on each question, so answers always cover everything said
+   * up to that moment.
+   */
+  liveTranscript?: LiveTranscriptLine[];
   meetingTitle?: string;
 }
 
 /**
  * Ask questions about a meeting, answered by the configured summary model
- * grounded in the meeting's stored transcript. Fully local when the summary
- * model is Ollama or Built-in AI.
+ * grounded in that meeting's transcript. Fully local when the summary model
+ * is Ollama or Built-in AI. Works both for saved meetings (`meetingId`) and
+ * the meeting currently being recorded (`liveTranscript`).
  */
-export function MeetingChatPanel({ meetingId, meetingTitle }: MeetingChatPanelProps) {
+export function MeetingChatPanel({
+  meetingId,
+  liveTranscript,
+  meetingTitle,
+}: MeetingChatPanelProps) {
+  const isLive = liveTranscript !== undefined;
+  // Nothing transcribed yet -- the backend would just reject the question.
+  const hasLiveContent = !isLive || (liveTranscript?.some((t) => t.text.trim()) ?? false);
+  // Read the transcript at question time, not render time, so a long-running
+  // panel doesn't answer from a stale snapshot.
+  const liveTranscriptRef = useRef<LiveTranscriptLine[] | undefined>(liveTranscript);
+  useEffect(() => {
+    liveTranscriptRef.current = liveTranscript;
+  }, [liveTranscript]);
   const { modelConfig } = useConfig();
   const [isOpen, setIsOpen] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -63,12 +91,23 @@ export function MeetingChatPanel({ meetingId, meetingTitle }: MeetingChatPanelPr
     Analytics.trackButtonClick('meeting_chat_question', 'meeting_details');
 
     try {
-      const answer = await invoke<string>('api_chat_with_meeting', {
-        meetingId,
-        provider: modelConfig.provider,
-        model: modelConfig.model,
-        messages: nextMessages,
-      });
+      const answer = isLive
+        ? await invoke<string>('api_chat_with_live_transcript', {
+            title: meetingTitle ?? null,
+            transcript: (liveTranscriptRef.current ?? []).map((t) => ({
+              text: t.text,
+              audio_start_time: t.audio_start_time ?? null,
+            })),
+            provider: modelConfig.provider,
+            model: modelConfig.model,
+            messages: nextMessages,
+          })
+        : await invoke<string>('api_chat_with_meeting', {
+            meetingId,
+            provider: modelConfig.provider,
+            model: modelConfig.model,
+            messages: nextMessages,
+          });
       setMessages((prev) => [...prev, { role: 'assistant', content: answer }]);
     } catch (err) {
       const message = typeof err === 'string' ? err : (err as Error)?.message || String(err);
@@ -80,7 +119,7 @@ export function MeetingChatPanel({ meetingId, meetingTitle }: MeetingChatPanelPr
     } finally {
       setIsThinking(false);
     }
-  }, [input, isThinking, messages, meetingId, modelConfig.provider, modelConfig.model]);
+  }, [input, isThinking, messages, meetingId, isLive, meetingTitle, modelConfig.provider, modelConfig.model]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -97,10 +136,10 @@ export function MeetingChatPanel({ meetingId, meetingTitle }: MeetingChatPanelPr
           Analytics.trackButtonClick('meeting_chat_open', 'meeting_details');
         }}
         className="fixed bottom-6 right-6 z-40 flex items-center gap-2 px-4 py-3 bg-blue-600 text-white rounded-full shadow-lg hover:bg-blue-700 transition-colors"
-        title="Ask questions about this meeting"
+        title={isLive ? 'Ask about what has been said so far' : 'Ask questions about this meeting'}
       >
         <MessageSquare className="w-5 h-5" />
-        <span className="text-sm font-medium">Ask</span>
+        <span className="text-sm font-medium">{isLive ? 'Catch me up' : 'Ask'}</span>
       </button>
     );
   }
@@ -112,7 +151,9 @@ export function MeetingChatPanel({ meetingId, meetingTitle }: MeetingChatPanelPr
         <div className="flex items-center gap-2 min-w-0">
           <Sparkles className="w-4 h-4 text-blue-600 shrink-0" />
           <div className="min-w-0">
-            <p className="text-sm font-semibold text-gray-900 truncate">Ask about this meeting</p>
+            <p className="text-sm font-semibold text-gray-900 truncate">
+              {isLive ? 'Ask about this meeting (live)' : 'Ask about this meeting'}
+            </p>
             <p className="text-xs text-gray-500 truncate">
               {modelConfig.provider === 'ollama' || modelConfig.provider === 'builtin-ai'
                 ? `Local model: ${modelConfig.model || 'default'}`
@@ -134,11 +175,27 @@ export function MeetingChatPanel({ meetingId, meetingTitle }: MeetingChatPanelPr
         {messages.length === 0 && !error && (
           <div className="text-center text-sm text-gray-500 mt-8 space-y-2">
             <MessageSquare className="w-8 h-8 mx-auto text-gray-300" />
-            <p>Ask anything about {meetingTitle ? `"${meetingTitle}"` : 'this meeting'}.</p>
-            <p className="text-xs text-gray-400">
-              e.g. &quot;What did we decide?&quot; &middot; &quot;What are my action items?&quot;
-              &middot; &quot;When did we discuss the budget?&quot;
-            </p>
+            {isLive ? (
+              <>
+                <p>
+                  {hasLiveContent
+                    ? 'Ask about anything said so far in this meeting.'
+                    : 'Waiting for the first few lines of transcript...'}
+                </p>
+                <p className="text-xs text-gray-400">
+                  e.g. &quot;What did I just miss?&quot; &middot; &quot;Recap the last 5
+                  minutes&quot; &middot; &quot;Has the deadline come up?&quot;
+                </p>
+              </>
+            ) : (
+              <>
+                <p>Ask anything about {meetingTitle ? `"${meetingTitle}"` : 'this meeting'}.</p>
+                <p className="text-xs text-gray-400">
+                  e.g. &quot;What did we decide?&quot; &middot; &quot;What are my action
+                  items?&quot; &middot; &quot;When did we discuss the budget?&quot;
+                </p>
+              </>
+            )}
           </div>
         )}
 
@@ -185,14 +242,14 @@ export function MeetingChatPanel({ meetingId, meetingTitle }: MeetingChatPanelPr
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder="Ask a question..."
-          disabled={isThinking}
+          placeholder={hasLiveContent ? 'Ask a question...' : 'Waiting for transcript...'}
+          disabled={isThinking || !hasLiveContent}
           className="flex-1 px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 disabled:bg-gray-50"
         />
         <Button
           size="sm"
           onClick={sendQuestion}
-          disabled={isThinking || !input.trim()}
+          disabled={isThinking || !input.trim() || !hasLiveContent}
           className="bg-blue-600 hover:bg-blue-700 shrink-0"
           title="Send"
         >

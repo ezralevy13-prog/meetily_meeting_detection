@@ -30,6 +30,15 @@ pub struct MeetingChatMessage {
     pub content: String,
 }
 
+/// One transcript line from an in-progress recording, as held by the
+/// frontend's transcript context.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LiveTranscriptLine {
+    pub text: String,
+    #[serde(default)]
+    pub audio_start_time: Option<f64>,
+}
+
 /// Answer a question about a meeting, grounded in its stored transcript.
 ///
 /// `messages` is the chat history in order; the last entry must be the
@@ -45,13 +54,6 @@ pub async fn api_chat_with_meeting<R: Runtime>(
     model: String,
     messages: Vec<MeetingChatMessage>,
 ) -> Result<String, String> {
-    let question = messages
-        .last()
-        .filter(|m| m.role == "user")
-        .map(|m| m.content.trim().to_string())
-        .filter(|c| !c.is_empty())
-        .ok_or_else(|| "The last chat message must be a non-empty user question".to_string())?;
-
     info!(
         "api_chat_with_meeting: meeting_id={}, provider={}, model={}, history_len={}",
         meeting_id,
@@ -67,30 +69,117 @@ pub async fn api_chat_with_meeting<R: Runtime>(
         .map_err(|e| format!("Failed to load meeting: {}", e))?
         .ok_or_else(|| format!("Meeting {} not found", meeting_id))?;
 
-    // Build a timestamped transcript. Timestamps let the model answer
-    // "when did we talk about X" questions.
+    let lines: Vec<LiveTranscriptLine> = meeting
+        .transcripts
+        .iter()
+        .map(|t| LiveTranscriptLine {
+            text: t.text.clone(),
+            audio_start_time: t.audio_start_time,
+        })
+        .collect();
+    let transcript = build_transcript(&lines);
+    if transcript.is_empty() {
+        return Err("This meeting has no transcript to chat about".to_string());
+    }
+
+    answer_question(
+        &app,
+        &pool,
+        &meeting.title,
+        &transcript,
+        &provider,
+        &model,
+        &messages,
+        false,
+    )
+    .await
+}
+
+/// Answer a question about the meeting currently being recorded, grounded in
+/// the transcript captured so far. Same as `api_chat_with_meeting` but the
+/// transcript comes from the frontend's live state rather than the database,
+/// since an in-progress meeting hasn't been saved yet.
+#[tauri::command]
+pub async fn api_chat_with_live_transcript<R: Runtime>(
+    app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    title: Option<String>,
+    transcript: Vec<LiveTranscriptLine>,
+    provider: String,
+    model: String,
+    messages: Vec<MeetingChatMessage>,
+) -> Result<String, String> {
+    info!(
+        "api_chat_with_live_transcript: provider={}, model={}, lines={}",
+        provider,
+        model,
+        transcript.len()
+    );
+
+    let transcript = build_transcript(&transcript);
+    if transcript.is_empty() {
+        return Err("Nothing has been transcribed yet in this meeting".to_string());
+    }
+
+    let pool = state.db_manager.pool().clone();
+    let title = title.unwrap_or_else(|| "the meeting in progress".to_string());
+
+    answer_question(
+        &app,
+        &pool,
+        &title,
+        &transcript,
+        &provider,
+        &model,
+        &messages,
+        true,
+    )
+    .await
+}
+
+/// Build a timestamped transcript. Timestamps let the model answer
+/// "when did we talk about X" questions.
+fn build_transcript(lines: &[LiveTranscriptLine]) -> String {
     let mut transcript = String::new();
-    for t in &meeting.transcripts {
-        let text = t.text.trim();
+    for line in lines {
+        let text = line.text.trim();
         if text.is_empty() {
             continue;
         }
-        if let Some(start) = t.audio_start_time {
+        if let Some(start) = line.audio_start_time {
             transcript.push_str(&format!("[{}] ", format_timestamp(start)));
         }
         transcript.push_str(text);
         transcript.push('\n');
     }
-    if transcript.trim().is_empty() {
-        return Err("This meeting has no transcript to chat about".to_string());
-    }
+    transcript.trim().to_string()
+}
 
-    let llm_provider = LLMProvider::from_str(&provider)?;
+/// Shared question-answering core for saved and in-progress meetings.
+#[allow(clippy::too_many_arguments)]
+async fn answer_question<R: Runtime>(
+    app: &AppHandle<R>,
+    pool: &sqlx::SqlitePool,
+    title: &str,
+    transcript: &str,
+    provider: &str,
+    model: &str,
+    messages: &[MeetingChatMessage],
+    live: bool,
+) -> Result<String, String> {
+    let question = messages
+        .last()
+        .filter(|m| m.role == "user")
+        .map(|m| m.content.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| "The last chat message must be a non-empty user question".to_string())?;
+
+    let llm_provider = LLMProvider::from_str(provider)?;
 
     // Resolve API key / endpoints the same way the summary service does.
     let api_key = match llm_provider {
         LLMProvider::Ollama | LLMProvider::BuiltInAI | LLMProvider::CustomOpenAI => String::new(),
-        _ => SettingsRepository::get_api_key(&pool, &provider)
+        _ => SettingsRepository::get_api_key(pool, provider)
             .await
             .map_err(|e| format!("Failed to retrieve API key for {}: {}", provider, e))?
             .filter(|k| !k.is_empty())
@@ -98,7 +187,7 @@ pub async fn api_chat_with_meeting<R: Runtime>(
     };
 
     let ollama_endpoint = if llm_provider == LLMProvider::Ollama {
-        SettingsRepository::get_model_config(&pool)
+        SettingsRepository::get_model_config(pool)
             .await
             .ok()
             .flatten()
@@ -109,7 +198,7 @@ pub async fn api_chat_with_meeting<R: Runtime>(
 
     let (custom_openai_endpoint, custom_api_key, custom_max_tokens, custom_temperature, custom_top_p) =
         if llm_provider == LLMProvider::CustomOpenAI {
-            let config = SettingsRepository::get_custom_openai_config(&pool)
+            let config = SettingsRepository::get_custom_openai_config(pool)
                 .await
                 .map_err(|e| format!("Failed to retrieve custom OpenAI config: {}", e))?
                 .ok_or_else(|| "Custom OpenAI provider selected but not configured".to_string())?;
@@ -135,7 +224,7 @@ pub async fn api_chat_with_meeting<R: Runtime>(
     let max_transcript_chars: usize = match llm_provider {
         LLMProvider::Ollama => {
             match CHAT_METADATA_CACHE
-                .get_or_fetch(&model, ollama_endpoint.as_deref())
+                .get_or_fetch(model, ollama_endpoint.as_deref())
                 .await
             {
                 // Reserve ~1500 tokens for the system prompt, history, and answer.
@@ -150,11 +239,25 @@ pub async fn api_chat_with_meeting<R: Runtime>(
         LLMProvider::BuiltInAI => 24_000,
         _ => 100_000,
     };
-    let transcript = truncate_transcript(&transcript, max_transcript_chars);
+    let transcript = truncate_transcript(transcript, max_transcript_chars);
+
+    // In-progress meetings need the model to understand the transcript is
+    // partial -- otherwise "has X been mentioned?" reads as a claim about
+    // the whole meeting rather than about what has been said so far.
+    let context_note = if live {
+        "This meeting is happening RIGHT NOW and the transcript below covers only what has \
+         been said so far. Treat it as the meeting up to this moment; more will follow. \
+         The user is often catching up on something they just missed, so favour the most \
+         recent part of the transcript unless they ask about something earlier."
+    } else {
+        "This meeting has ended and the transcript below is the complete record of it."
+    };
 
     let system_prompt = format!(
         "You are Meetily's meeting assistant. Answer the user's questions about the meeting \
          \"{}\" using ONLY the transcript below.\n\
+         \n\
+         {}\n\
          \n\
          Rules:\n\
          - Ground every answer in the transcript; quote or paraphrase what was actually said.\n\
@@ -165,7 +268,7 @@ pub async fn api_chat_with_meeting<R: Runtime>(
          \n\
          TRANSCRIPT:\n\
          {}",
-        meeting.title, transcript
+        title, context_note, transcript
     );
 
     // Flatten prior turns into the user prompt (the shared client takes a
@@ -198,7 +301,7 @@ pub async fn api_chat_with_meeting<R: Runtime>(
     generate_summary(
         &client,
         &llm_provider,
-        &model,
+        model,
         &api_key,
         &system_prompt,
         &user_prompt,

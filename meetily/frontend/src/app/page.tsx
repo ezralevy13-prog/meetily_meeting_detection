@@ -11,6 +11,7 @@ import { useConfig } from '@/contexts/ConfigContext';
 import { StatusOverlays } from '@/app/_components/StatusOverlays';
 import Analytics from '@/lib/analytics';
 import { SettingsModals } from './_components/SettingsModal';
+import { MeetingChatPanel } from '@/components/MeetingDetails/MeetingChatPanel';
 import { TranscriptPanel } from './_components/TranscriptPanel';
 import { useModalState } from '@/hooks/useModalState';
 import { useRecordingStateSync } from '@/hooks/useRecordingStateSync';
@@ -29,7 +30,7 @@ export default function Home() {
   const [showRecoveryDialog, setShowRecoveryDialog] = useState(false);
 
   // Use contexts for state management
-  const { meetingTitle } = useTranscripts();
+  const { meetingTitle, transcripts } = useTranscripts();
   const { transcriptModelConfig, selectedDevices } = useConfig();
   const recordingState = useRecordingState();
 
@@ -252,6 +253,15 @@ export default function Home() {
               </div>
             </div>
           )}
+
+        {/* Ask questions about the meeting while it is still being recorded,
+            answered from the transcript captured so far. */}
+        {recordingState.isRecording && (
+          <MeetingChatPanel
+            liveTranscript={transcripts}
+            meetingTitle={meetingTitle}
+          />
+        )}
 
         {/* Status Overlays - Processing and Saving */}
         <StatusOverlays
