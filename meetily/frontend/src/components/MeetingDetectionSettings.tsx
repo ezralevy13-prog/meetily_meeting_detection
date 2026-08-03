@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { Switch } from '@/components/ui/switch';
-import { Video, Users, Monitor, Bell, Play, Square, Timer, AlertTriangle } from 'lucide-react';
+import { Video, Users, Monitor, Bell, Play, Square, Timer, AlertTriangle, CalendarDays } from 'lucide-react';
 import { toast } from 'sonner';
 
 interface MeetingDetectionSettings {
@@ -15,7 +15,17 @@ interface MeetingDetectionSettings {
   notify_on_detection: boolean;
   poll_interval_secs: number;
   auto_stop_grace_secs: number;
+  name_from_calendar: boolean;
+  calendar_ids: string[];
 }
+
+interface CalendarInfo {
+  id: string;
+  title: string;
+  source: string;
+}
+
+type CalendarAccess = 'not_determined' | 'granted' | 'denied' | 'unsupported';
 
 interface DetectedMeeting {
   app_name: string;
@@ -38,6 +48,46 @@ export function MeetingDetectionSettings() {
   const [status, setStatus] = useState<MeetingDetectionStatus | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
+  const [calendarAccess, setCalendarAccess] = useState<CalendarAccess>('not_determined');
+  const [calendars, setCalendars] = useState<CalendarInfo[]>([]);
+  const [isRequestingAccess, setIsRequestingAccess] = useState(false);
+
+  const loadCalendars = useCallback(async () => {
+    try {
+      const access = await invoke<CalendarAccess>('get_calendar_access_status');
+      setCalendarAccess(access);
+      if (access === 'granted') {
+        setCalendars(await invoke<CalendarInfo[]>('list_calendars'));
+      }
+    } catch (error) {
+      console.error('Failed to load calendars:', error);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadCalendars();
+  }, [loadCalendars]);
+
+  const handleGrantCalendarAccess = async () => {
+    setIsRequestingAccess(true);
+    try {
+      const access = await invoke<CalendarAccess>('request_calendar_access');
+      setCalendarAccess(access);
+      if (access === 'granted') {
+        setCalendars(await invoke<CalendarInfo[]>('list_calendars'));
+      } else if (access === 'denied') {
+        toast.error('Calendar access denied', {
+          description:
+            'Enable it under System Settings > Privacy & Security > Calendars to name recordings from your events.',
+        });
+      }
+    } catch (error) {
+      console.error('Calendar permission request failed:', error);
+      toast.error('Could not request calendar access');
+    } finally {
+      setIsRequestingAccess(false);
+    }
+  };
 
   useEffect(() => {
     const loadSettings = async () => {
@@ -361,6 +411,99 @@ export function MeetingDetectionSettings() {
           />
         </div>
       </div>
+
+      {/* Recording names from calendar */}
+      {calendarAccess !== 'unsupported' && (
+        <div className="space-y-3 pt-2 border-t">
+          <h4 className="font-medium text-gray-900 pt-4">Recording Names</h4>
+
+          <div className="flex items-center justify-between p-4 border rounded-lg">
+            <div className="flex items-center space-x-3">
+              <CalendarDays className="w-5 h-5 text-indigo-500" />
+              <div>
+                <div className="font-medium">Name from calendar event</div>
+                <div className="text-sm text-gray-600">
+                  Use the title of the event happening at the time, instead of &quot;Zoom
+                  Meeting&quot;
+                </div>
+              </div>
+            </div>
+            <Switch
+              checked={settings.name_from_calendar}
+              onCheckedChange={() => handleToggle('name_from_calendar')}
+              disabled={isSaving || !settings.enabled}
+            />
+          </div>
+
+          {settings.name_from_calendar && settings.enabled && (
+            <>
+              {calendarAccess !== 'granted' ? (
+                <div className="p-4 border rounded-lg bg-gray-50 space-y-3">
+                  <p className="text-sm text-gray-700">
+                    {calendarAccess === 'denied'
+                      ? 'Calendar access is turned off. Enable Meetily under System Settings > Privacy & Security > Calendars, then reopen this tab.'
+                      : 'Meetily needs permission to read your calendar. Accounts synced into macOS Calendar — including Google — are all available.'}
+                  </p>
+                  {calendarAccess === 'not_determined' && (
+                    <button
+                      onClick={handleGrantCalendarAccess}
+                      disabled={isRequestingAccess}
+                      className="px-3 py-1.5 text-sm font-medium rounded-md bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 transition-colors"
+                    >
+                      {isRequestingAccess ? 'Waiting for permission...' : 'Allow calendar access'}
+                    </button>
+                  )}
+                </div>
+              ) : (
+                <div className="p-4 border rounded-lg bg-gray-50">
+                  <div className="flex items-center justify-between mb-3">
+                    <p className="text-sm font-medium text-gray-900">Calendars to use</p>
+                    <button
+                      onClick={loadCalendars}
+                      className="text-xs text-blue-600 hover:text-blue-700"
+                    >
+                      Refresh
+                    </button>
+                  </div>
+                  <p className="text-xs text-gray-500 mb-3">
+                    {settings.calendar_ids.length === 0
+                      ? 'No calendars selected — every calendar is searched, including holidays and birthdays. Pick the ones your meetings live in.'
+                      : `Searching ${settings.calendar_ids.length} of ${calendars.length} calendars.`}
+                  </p>
+                  <div className="space-y-2 max-h-56 overflow-y-auto">
+                    {calendars.map((cal) => (
+                      <label
+                        key={cal.id}
+                        className="flex items-center gap-3 text-sm cursor-pointer py-1"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={settings.calendar_ids.includes(cal.id)}
+                          onChange={(e) => {
+                            const next = e.target.checked
+                              ? [...settings.calendar_ids, cal.id]
+                              : settings.calendar_ids.filter((id) => id !== cal.id);
+                            updateSettings({ ...settings, calendar_ids: next });
+                          }}
+                          disabled={isSaving}
+                          className="rounded border-gray-300"
+                        />
+                        <span className="text-gray-900">{cal.title}</span>
+                        {cal.source && (
+                          <span className="text-xs text-gray-500">{cal.source}</span>
+                        )}
+                      </label>
+                    ))}
+                    {calendars.length === 0 && (
+                      <p className="text-sm text-gray-500">No calendars found.</p>
+                    )}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
 
       {/* Privacy notice */}
       <div className="p-4 bg-blue-50 rounded-lg border border-blue-200">

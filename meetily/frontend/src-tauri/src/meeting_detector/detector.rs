@@ -5,7 +5,7 @@
 use crate::meeting_detector::meeting_apps::*;
 #[cfg(target_os = "macos")]
 use log::debug;
-use log::{info, warn, error};
+use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -53,6 +53,18 @@ pub struct MeetingDetectionSettings {
     /// Zoom connection) without splitting one meeting into two recordings.
     #[serde(default = "default_auto_stop_grace_secs")]
     pub auto_stop_grace_secs: u64,
+    /// Name recordings after the calendar event happening at the time.
+    #[serde(default = "default_true")]
+    pub name_from_calendar: bool,
+    /// Calendar identifiers to draw event names from. Empty means every
+    /// calendar the user has -- which is rarely what they want, since
+    /// birthdays and holidays live in calendars of their own.
+    #[serde(default)]
+    pub calendar_ids: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_auto_stop_grace_secs() -> u64 {
@@ -90,6 +102,8 @@ impl Default for MeetingDetectionSettings {
             notify_on_detection: true,
             poll_interval_secs: 5,
             auto_stop_grace_secs: default_auto_stop_grace_secs(),
+            name_from_calendar: true,
+            calendar_ids: Vec::new(),
         }
     }
 }
@@ -450,24 +464,27 @@ impl MeetingDetector {
                             } else {
                                 // Prefer the title of whatever calendar event is
                                 // happening right now over a generic app name.
-                                // Run it off-thread with a timeout: AppleScript
-                                // queries over large calendars can take many
-                                // seconds and must not delay the recording. Only
-                                // attempt it while Calendar.app is already
-                                // running, because `tell application` would
-                                // otherwise launch it mid-join.
-                                let calendar_running = system_has_process(&system, "Calendar");
+                                // EventKit reads the local calendar store, so
+                                // this covers Google/iCloud/Exchange accounts
+                                // synced into macOS Calendar. Run it off-thread
+                                // under a timeout so a slow calendar store can
+                                // never delay the recording.
                                 let fallback_name = format!("{} Meeting", meeting_info.app_name);
-                                let meeting_name = match tokio::time::timeout(
-                                    Duration::from_secs(3),
-                                    tokio::task::spawn_blocking(move || {
-                                        current_calendar_event_title(calendar_running)
-                                    }),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(Some(title))) => title,
-                                    _ => fallback_name,
+                                let meeting_name = if current_settings.name_from_calendar {
+                                    let calendar_ids = current_settings.calendar_ids.clone();
+                                    match tokio::time::timeout(
+                                        Duration::from_secs(3),
+                                        tokio::task::spawn_blocking(move || {
+                                            super::calendar::current_event_title(&calendar_ids)
+                                        }),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(Some(title))) => title,
+                                        _ => fallback_name,
+                                    }
+                                } else {
+                                    fallback_name
                                 };
                                 info!("Auto-starting recording for: {}", meeting_name);
 
@@ -623,83 +640,6 @@ fn detect_meeting_from_system(
         }
     }
 
-    None
-}
-
-/// True if a process with exactly this name (case-insensitive) is running.
-fn system_has_process(system: &System, name: &str) -> bool {
-    system
-        .processes()
-        .values()
-        .any(|p| p.name().to_string_lossy().eq_ignore_ascii_case(name))
-}
-
-/// Look up the title of whatever calendar event is happening right now, via
-/// the macOS Calendar app, so recordings can be named after the meeting
-/// instead of a generic "<App> Meeting". Returns `None` if there's no
-/// current event, Calendar access hasn't been granted, or `osascript` fails
-/// -- callers should fall back to a generic name in that case.
-///
-/// Blocking (osascript can take seconds on large calendars): callers must run
-/// it via `spawn_blocking`, ideally under a timeout. `calendar_running` should
-/// come from a process scan -- `tell application "Calendar"` launches the app
-/// when it isn't running, and popping Calendar open mid-meeting-join is worse
-/// than falling back to a generic recording name.
-#[cfg(target_os = "macos")]
-fn current_calendar_event_title(calendar_running: bool) -> Option<String> {
-    if !calendar_running {
-        debug!("Calendar.app is not running, skipping calendar lookup");
-        return None;
-    }
-
-    // All-day events are excluded: they span the whole day (holidays,
-    // birthdays, "Vacation"), so they'd otherwise always win over the
-    // actual meeting slot.
-    const SCRIPT: &str = r#"
-        tell application "Calendar"
-            set nowDate to current date
-            repeat with cal in calendars
-                try
-                    set matchingEvents to (every event of cal whose allday event is false and start date ≤ nowDate and end date ≥ nowDate)
-                    if (count of matchingEvents) > 0 then
-                        return summary of (item 1 of matchingEvents)
-                    end if
-                end try
-            end repeat
-            return ""
-        end tell
-    "#;
-
-    let output = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(SCRIPT)
-        .output();
-
-    match output {
-        Ok(output) if output.status.success() => {
-            let title = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if title.is_empty() {
-                None
-            } else {
-                Some(title)
-            }
-        }
-        Ok(output) => {
-            debug!(
-                "Calendar lookup via osascript failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-            None
-        }
-        Err(e) => {
-            debug!("Failed to run osascript for calendar lookup: {}", e);
-            None
-        }
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn current_calendar_event_title(_calendar_running: bool) -> Option<String> {
     None
 }
 

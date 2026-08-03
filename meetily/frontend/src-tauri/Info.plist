@@ -8,6 +8,12 @@
     <string>This application needs screen recording permission to capture system audio during meetings.</string>
     <key>NSAudioCaptureUsageDescription</key>
     <string>This application needs permission to capture system audio output for meeting transcription and recording.</string>
+    <!-- macOS 14+ splits calendar access; the FullAccess key is the one that
+         prompts on current systems, the older key covers macOS 13 and below. -->
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>Meetily reads the event happening at the time of a meeting so recordings can be named after it instead of "Zoom Meeting".</string>
+    <key>NSCalendarsUsageDescription</key>
+    <string>Meetily reads the event happening at the time of a meeting so recordings can be named after it instead of "Zoom Meeting".</string>
     <key>com.apple.security.device.audio-input</key>
     <true/>
 </dict>

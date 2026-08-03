@@ -9,6 +9,7 @@
 //! - Windows: Process detection (Google Meet browser detection not yet implemented)
 //! - Linux: Process detection (Google Meet browser detection not yet implemented)
 
+pub mod calendar;
 pub mod commands;
 pub mod detector;
 

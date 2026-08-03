@@ -125,6 +125,32 @@ pub async fn start_meeting_monitor<R: Runtime>(
     Ok(())
 }
 
+/// Current calendar permission state, without prompting.
+#[tauri::command]
+pub async fn get_calendar_access_status() -> Result<super::calendar::CalendarAccess, String> {
+    Ok(super::calendar::access_status())
+}
+
+/// Show the system calendar permission prompt if the user hasn't answered it
+/// yet, and report the result. Blocking work runs off the async runtime so the
+/// UI stays responsive while the prompt is up.
+#[tauri::command]
+pub async fn request_calendar_access() -> Result<super::calendar::CalendarAccess, String> {
+    tokio::task::spawn_blocking(super::calendar::request_access)
+        .await
+        .map_err(|e| format!("Calendar permission request failed: {}", e))
+}
+
+/// List calendars available for naming recordings. Empty when access hasn't
+/// been granted -- callers should check `get_calendar_access_status` to tell
+/// "no permission" apart from "no calendars".
+#[tauri::command]
+pub async fn list_calendars() -> Result<Vec<super::calendar::CalendarInfo>, String> {
+    tokio::task::spawn_blocking(super::calendar::list_calendars)
+        .await
+        .map_err(|e| format!("Failed to list calendars: {}", e))
+}
+
 /// Stop the meeting detection monitor
 #[tauri::command]
 pub async fn stop_meeting_monitor(
