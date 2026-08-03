@@ -410,7 +410,10 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        // The updater plugin is intentionally not registered: this fork has no
+        // update feed of its own, and the upstream one it used to point at
+        // would replace this build with stock Meetily. The frontend's update
+        // check logs and ignores the resulting "command not found" error.
         .plugin(tauri_plugin_process::init())
         .manage(whisper_engine::parallel_commands::ParallelProcessorState::new())
         .manage(Arc::new(RwLock::new(
