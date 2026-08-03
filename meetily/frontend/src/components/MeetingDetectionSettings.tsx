@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { Switch } from '@/components/ui/switch';
-import { Video, Users, Monitor, Bell, Play, Square, Timer } from 'lucide-react';
+import { Video, Users, Monitor, Bell, Play, Square, Timer, AlertTriangle } from 'lucide-react';
 import { toast } from 'sonner';
 
 interface MeetingDetectionSettings {
@@ -143,6 +143,46 @@ export function MeetingDetectionSettings() {
           disabled={isSaving}
         />
       </div>
+
+      {/* Detection is on but nothing will happen automatically -- easy to
+          set up by accident, and it looks exactly like a broken feature. */}
+      {settings.enabled && !settings.auto_start_recording && (
+        <div className="flex items-start gap-3 p-4 rounded-lg border border-amber-200 bg-amber-50">
+          <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+          <div className="flex-1">
+            <p className="text-sm font-medium text-amber-900">
+              Meetings will be detected, but recording won&apos;t start
+            </p>
+            <p className="text-sm text-amber-800 mt-0.5">
+              Turn on <strong>Auto-start Recording</strong> below for meetings to record
+              themselves. Otherwise detection only updates the status shown here.
+            </p>
+          </div>
+          <button
+            onClick={() => handleToggle('auto_start_recording')}
+            disabled={isSaving}
+            className="shrink-0 px-3 py-1.5 text-sm font-medium rounded-md bg-amber-600 text-white hover:bg-amber-700 disabled:opacity-50 transition-colors"
+          >
+            Turn on
+          </button>
+        </div>
+      )}
+
+      {/* Auto-started recordings would run until stopped by hand. */}
+      {settings.enabled && settings.auto_start_recording && !settings.auto_stop_recording && (
+        <div className="flex items-start gap-3 p-4 rounded-lg border border-amber-200 bg-amber-50">
+          <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+          <div className="flex-1">
+            <p className="text-sm font-medium text-amber-900">
+              Recordings won&apos;t stop on their own
+            </p>
+            <p className="text-sm text-amber-800 mt-0.5">
+              With <strong>Auto-stop Recording</strong> off, a recording started by detection
+              keeps going after the meeting ends until you stop it manually.
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* Status */}
       {settings.enabled && status && (
